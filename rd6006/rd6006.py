@@ -1,25 +1,50 @@
 import minimalmodbus
-
-minimalmodbus.TIMEOUT = 0.5
-
+import time
 
 class RD6006:
+    retry = 5
+
+    def reachable(requesttype, port, address=1, baudrate=115200):
+        instrument = minimalmodbus.Instrument(port=port, slaveaddress=address)
+        instrument.serial.baudrate = baudrate
+        instrument.serial.timeout = 0.5
+        sn   = None
+        fw   = None
+        type = None
+        try:
+            regs = instrument.read_registers(0, 4)
+            sn = regs[1] << 16 | regs[2]
+            fw = regs[3] / 100
+            type = int(regs[0] / 10)
+        except minimalmodbus.NoResponseError:
+            return False
+        except minimalmodbus.InvalidResponseError:
+            return False
+        return type == requesttype
+    reachable = staticmethod(reachable)
+
     def __init__(self, port, address=1, baudrate=115200):
+        self.attempt = 0
         self.port = port
         self.address = address
         self.instrument = minimalmodbus.Instrument(port=port, slaveaddress=address)
         self.instrument.serial.baudrate = baudrate
+        self.instrument.serial.timeout = 0.5
         regs = self._read_registers(0, 4)
         self.sn = regs[1] << 16 | regs[2]
         self.fw = regs[3] / 100
         self.type = int(regs[0] / 10)
 
-        if self.type == 6012 or self.type == 6018 or self.type == 6024:
-            print("RD6012, RD6018 or RD6024 detected")
+        if self.type == 6012 or self.type == 6018:
+            #print("RD6012 or RD6018 detected")
+            self.voltres = 100
+            self.ampres = 100
+        elif self.type == 6024:
+            #print("RD6024 detected")
             self.voltres = 100
             self.ampres = 100
         else:
-            print("RD6006 or other detected")
+            #print("RD6006 or other detected")
             self.voltres = 100
             self.ampres = 1000
 
@@ -27,24 +52,43 @@ class RD6006:
         return f"RD6006 SN:{self.sn} FW:{self.fw}"
 
     def _read_register(self, register):
-        try:
-            return self.instrument.read_register(register)
-        except minimalmodbus.NoResponseError:
-            return self._read_register(register)
+        if( self.attempt < self.retry ):
+          try:
+              r = self.instrument.read_register(register)
+              self.attempt = 0
+              return r
+          except minimalmodbus.NoResponseError:
+              self.attempt+=1
+              return self._read_register(register)
 
     def _read_registers(self, start, length):
-        try:
-            return self.instrument.read_registers(start, length)
-        except minimalmodbus.NoResponseError:
-            return self._read_registers(start, length)
-        except minimalmodbus.InvalidResponseError:
-            return self._read_registers(start, length)
+        if( self.attempt < self.retry ):
+          try:
+              r = self.instrument.read_registers(start, length)
+              self.attempt = 0
+              return r
+          except minimalmodbus.NoResponseError:
+              self.attempt+=1
+              return self._read_registers(start, length)
+          except minimalmodbus.InvalidResponseError:
+              self.attempt+=1
+              return self._read_registers(start, length)
 
     def _write_register(self, register, value):
-        try:
-            return self.instrument.write_register(register, value)
-        except minimalmodbus.NoResponseError:
-            return self._write_register(register, value)
+        if( self.attempt < self.retry ):
+          try:
+              r = self.instrument.write_register(register, value)
+              self.attempt = 0
+              return r
+          except minimalmodbus.NoResponseError:
+              self.attempt+=1
+              return self._write_register(register, value)
+
+    def isFailed(self):
+        return self.attempt >= self.retry
+
+    def clearRetry(self):
+        self.attempt = 0
 
     def _mem(self, M=0):
         """reads the 4 register of a Memory[0-9] and print on a single line"""
@@ -94,6 +138,26 @@ class RD6006:
         print("== Memories")
         for m in range(10):
             self._mem(M=m)
+
+    def chargeOverview(self):
+        sreg=4
+        regs = self._read_registers(sreg, 38)
+
+        data = {}
+        #4 - 41
+        data["enable"]            = regs[18-sreg]
+        data["battvoltage"]       = regs[33-sreg] / self.voltres
+        data["current"]           = regs[9-sreg] / self.ampres
+        data["measpower"]         = ( regs[12-sreg] << 16 | regs[13-sreg]) / 100.0
+        data["voltage"]           = regs[14-sreg] / self.voltres
+        data["meastemp_external"] = regs[35-sreg]
+        if regs[34-sreg]:
+            data["meastemp_external"] = -data["meastemp_external"]
+        data["meastemp_internal"] = regs[5-sreg]
+        if regs[4-sreg]:
+            data["meastemp_internal"] = -data["meastemp_internal"]
+        data["measwh"]            = ( regs[40-sreg] << 16 | regs[41-sreg]) / 1000
+        return data
 
     @property
     def input_voltage(self):
@@ -147,7 +211,8 @@ class RD6006:
     def measpower(self):
         return (
             self._read_register(12) << 16 | self._read_register(13)
-        ) / 100
+        ) / 100  
+        #return self._read_register(13) / 100
 
     @property
     def measah(self):
@@ -167,7 +232,7 @@ class RD6006:
 
     @property
     def battvoltage(self):
-        return self._read_register(33)
+        return self._read_register(33) / self.voltres
 
     @property
     def current(self):
